@@ -6,6 +6,9 @@ import matplotlib.dates as mdates
 from matplotlib.gridspec import GridSpec
 import warnings
 warnings.filterwarnings("ignore")
+
+from pvlib.temperature import sapm_cell, faiman
+
 import os
 
 from fetch_solar_data import SITE, PARK, PERIOD, ECONOMICS
@@ -119,8 +122,7 @@ def compute_pv_production(df_weather: pd.DataFrame) -> pd.DataFrame:
 
     # ---- 3.6 Effet bifacial simplifié ----
     # Gain bifacial ≈ bifaciality × albedo × poa_rear/poa_front
-    bifacial_gain = 0.090  # 9.0% gain net — TOPCon bifacialité 80-85%, tracker mono-axe GCR=0.33
-                           # (IEA PVPS Task 13, 2024 : gain bifacial tracker 8-12% vs 3-5% fixe)
+    bifacial_gain = 0.055  # 5.5% gain net
     poa_effective = poa_global * (1 + bifacial_gain)
 
     # ---- 3.7 Température de cellule (modèle SAPM — Sandia) ----
@@ -131,7 +133,16 @@ def compute_pv_production(df_weather: pd.DataFrame) -> pd.DataFrame:
     noct = 43  # °C — NOCT TOPCon bifacial verre-verre Type-N
     k_noct = (noct - 20) / 800  # °C/(W/m²)
     k_wind = 0.03              # Coefficient correction vent [°C/(m/s)]
-    temp_cell = temp_air + k_noct * poa_effective.values - k_wind * wind_speed
+    # temp_cell = temp_air + k_noct * poa_effective.values - k_wind * wind_speed
+
+    # Modèle Faiman — recommandé IEC 61853-2, plus adapté aux modules bifaciaux :
+    temp_cell = faiman(
+        poa_global=poa_effective,
+        temp_air=temp_air,
+        wind_speed=wind_speed,
+        u0=25.0,   # W/(m²·K) — convection naturelle
+        u1=6.84,   # W·s/(m³·K) — refroidissement par vent
+    )
 
     # ---- 3.8 Correction de rendement en température ----
     # P_DC = P_STC × (POA/1000) × [1 + γ × (T_cell - 25)]
@@ -143,9 +154,8 @@ def compute_pv_production(df_weather: pd.DataFrame) -> pd.DataFrame:
     p_dc_mw = p_dc_normalized * PARK["power_mwp"]
 
     # ---- 3.10 Pertes AC → Production nette ----
-    # Valeur retenue : +20% net (conservateur, intègre pertes stow tramontane ~2%)
-    TRACKER_GAIN = 1.20
-    p_ac_mw = p_dc_mw * PARK["pr_p50"] * TRACKER_GAIN
+
+    p_ac_mw = p_dc_mw * PARK["pr_p50"]
     p_ac_mw = p_ac_mw.clip(upper=PARK["power_mwp"], lower=0)
 
     # ---- Assemblage DataFrame résultats ----
@@ -187,7 +197,7 @@ def analyze_solar_resource(df: pd.DataFrame) -> dict:
     annual["GHI_kWh_m2"] = annual["GHI"] / 1000
     annual["prod_GWh"]   = annual["P_AC_MW"] / 1000
     annual["cf_pct"]     = annual["P_AC_MW"] / (PARK["power_mwp"] * 8760) * 100
-    annual["yield_kWh_kWp"] = annual["P_AC_MW"] * 1000 / PARK["power_mwp"]
+    annual["yield_kWh_kWp"] = annual["P_AC_MW"] * 1e6 / (PARK["power_mwp"] * 1e3)
 
     results["annual"] = annual
 
@@ -245,6 +255,10 @@ def compute_economics(df: pd.DataFrame, df_prices: pd.DataFrame, kpi: dict) -> d
     """
     eco = {}
 
+    r = ECONOMICS["discount_rate"]
+    n = PARK["lifetime_years"]
+    annuity_factor = (1 - (1 + r) ** (-n)) / r
+
     # ---- CAPEX ----
     power_kwp = PARK["power_mwp"] * 1000
     eco["capex_meur"]  = ECONOMICS["capex_eur_kwp"] * power_kwp / 1e6
@@ -257,6 +271,16 @@ def compute_economics(df: pd.DataFrame, df_prices: pd.DataFrame, kpi: dict) -> d
     df_merged["price_eur_mwh"] = df_merged["price_eur_mwh"].fillna(
         ECONOMICS["p50_price_eur_mwh"]
     )
+
+    # Loyer foncier annuel (indexé)
+    land_lease_yr0 = ECONOMICS["land_lease_eur_ha_yr"] * ECONOMICS["land_area_ha"] / 1e6  # M€
+    # Loyer cumulé actualisé sur 30 ans
+    land_lease_npv = sum(
+        land_lease_yr0 * (1 + ECONOMICS["land_lease_indexation"]) ** y / (1 + r) ** y
+        for y in range(1, n + 1)
+    )
+    eco["land_lease_meur_yr"]  = land_lease_yr0
+    eco["land_lease_npv_meur"] = land_lease_npv
 
     # Revenue = somme(P_AC [MW] * Price [€/MWh] * 1h)
     df_merged["revenue_eur_h"] = df_merged["P_AC_MW"] * df_merged["price_eur_mwh"]
@@ -279,9 +303,6 @@ def compute_economics(df: pd.DataFrame, df_prices: pd.DataFrame, kpi: dict) -> d
 
     # ---- LCOE simplifié ----
     # LCOE = (CAPEX + VAN(OPEX)) / VAN(Production)
-    r = ECONOMICS["discount_rate"]
-    n = PARK["lifetime_years"]
-    annuity_factor = (1 - (1 + r) ** (-n)) / r
 
     prod_annual_gwh = kpi["P50_GWh_yr"]
     # Production dégradée sur durée de vie
@@ -293,25 +314,17 @@ def compute_economics(df: pd.DataFrame, df_prices: pd.DataFrame, kpi: dict) -> d
     )
     opex_discounted = eco["opex_meur_yr"] * annuity_factor
 
-    eco["lcoe_eur_mwh"] = (eco["capex_meur"] + opex_discounted) / prod_lifetime_discounted * 1000
+    eco["lcoe_eur_mwh"] = 1000 * (eco["capex_meur"] + opex_discounted + eco["land_lease_npv_meur"]) / prod_lifetime_discounted
     eco["prod_lifetime_gwh"] = prod_annual_gwh * sum(deg)
 
     # ---- NPV simplifié P50 ----
     cashflows = [(eco["ebitda_meur_yr"] * d) / (1 + r) ** y
                  for y, d in zip(years, deg)]
-    eco["npv_meur_p50"] = sum(cashflows) - eco["capex_meur"]
+    eco["npv_meur_p50"] = sum(cashflows) - eco["capex_meur"] - eco["land_lease_npv_meur"]
+
 
     # ---- LCOE cible marché ----
     eco["target_ppa_eur_mwh"] = eco["lcoe_eur_mwh"] * 1.15  # Marge 15% pour viabilité
 
-    # Loyer foncier annuel (indexé)
-    land_lease_yr0 = ECONOMICS["land_lease_eur_ha_yr"] * ECONOMICS["land_area_ha"] / 1e6  # M€
-    # Loyer cumulé actualisé sur 30 ans
-    land_lease_npv = sum(
-        land_lease_yr0 * (1 + ECONOMICS["land_lease_indexation"]) ** y / (1 + r) ** y
-        for y in range(1, n + 1)
-    )
-    eco["land_lease_meur_yr"]  = land_lease_yr0
-    eco["land_lease_npv_meur"] = land_lease_npv
 
     return eco

@@ -62,7 +62,7 @@ ECONOMICS = {
     "p90_price_eur_mwh" : 58,     # Prix P90 (scénario conservateur)
     "discount_rate"     : 0.055,  # Taux d'actualisation (WACC)
     "land_lease_eur_ha_yr" : 2000,  
-    "land_area_ha"         : 22,     # Surface terrain [ha] — fixe GCR 0.40
+    "land_area_ha"         : 22.22,     # Surface terrain [ha] — fixe GCR 0.40
     "land_lease_indexation": 0.020,  # Indexation annuelle ICC/IPC [%/an]
 }
 
